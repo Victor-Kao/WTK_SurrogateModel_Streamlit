@@ -65,7 +65,7 @@ def render() -> None:
             """
             1. Define variables and generate a design on **DOE Sampling**.
             2. Run your simulator or test plan, then bring the table into **Machine Learning → Import Data**.
-            3. Fit a baseline on **Training**. Optionally refine it on **Advance Training** (regression).
+            3. Fit a baseline on **Training**. Optionally tune hyperparameters on **Hyperparameter Optimization** (regression).
             4. Confirm generalization on **Validation**.
             5. Inspect slices, importance, and diagnostics on **Model Information & Visualization**.
             """

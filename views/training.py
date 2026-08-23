@@ -1,22 +1,24 @@
-"""Training and advance-training subpages."""
+"""Training and hyperparameter-optimization subpages."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.model_selection import cross_val_predict
-
 from src.ml import (
     CHOICES,
     CLASSIFIERS,
     REGRESSORS,
+    REGRESSION_BO_MODELS,
+    REGRESSION_OBJECTIVES,
     assignment_export_frame,
     binary_positive_probability,
-    compare_models,
+    bo_default_param_config,
+    bo_total_steps,
     default_hyperparams,
     ensure_surrogate,
     feature_importance,
@@ -25,9 +27,12 @@ from src.ml import (
     is_surrogate,
     labels_from_binary_scores,
     make_cv_splitter,
+    objective_direction,
     predict_class_scores,
+    refit_bo_selection,
     roc_curve_table,
     row_assignments,
+    run_tree_bayesian_optimization,
     score_predictions,
     split_type_label,
     split_xy,
@@ -166,7 +171,7 @@ def _assignment_preview(
         return
 
     heading = (
-        "X / Y with data type (Training or Testing)"
+        "Input X & Output Y (Training / Testing)"
         if scheme == "Split Dataset"
         else "X / Y with CV fold ID"
     )
@@ -366,6 +371,14 @@ def _show_binary_results(
 
 def _parse_manual_value(kind: str, raw: Any, default: Any) -> Any:
     if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
         return bool(raw)
     if kind == "choice":
         if raw in {"None", "none", None}:
@@ -461,13 +474,309 @@ def _algorithm_setup(task: str, pfx: str, models: dict) -> tuple[str, bool, dict
     return model_name, scale, params
 
 
+def _bo_setup_fingerprint(
+    models: list[str],
+    objective: str,
+    scale: bool,
+    n_calls: int,
+    param_setup: dict[str, dict[str, dict[str, Any]]],
+) -> tuple:
+    frozen: dict[str, tuple] = {}
+    for model in models:
+        cfg = param_setup.get(model, {})
+        frozen[model] = tuple(
+            (name, cfg[name].get("kind"), cfg[name].get("initial"), cfg[name].get("low"), cfg[name].get("high"), tuple(cfg[name].get("choices", [])))
+            for name in sorted(cfg)
+        )
+    return (tuple(models), objective, scale, n_calls, tuple(sorted(frozen.items())))
+
+
+def _render_bo_param_controls(
+    pfx: str,
+    model_name: str,
+    configs: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    updated = {name: dict(cfg) for name, cfg in configs.items()}
+    cols = st.columns(3)
+    cols[0].markdown("**Parameter**")
+    cols[1].markdown("**Initial guess**")
+    cols[2].markdown("**Lower / upper bound**")
+    for name, cfg in updated.items():
+        kind = str(cfg["kind"])
+        c1, c2, c3 = st.columns(3)
+        c1.caption(name)
+        key_base = f"{pfx}_bo_{model_name}_{name}".replace(" ", "_")
+        if kind in {"float", "int"}:
+            initial = c2.number_input(
+                "Initial",
+                value=float(cfg["initial"]) if kind == "float" else int(cfg["initial"]),
+                key=f"{key_base}_init",
+                label_visibility="collapsed",
+            )
+            low, high = c3.columns(2)
+            low_val = low.number_input(
+                "Lower",
+                value=float(cfg["low"]),
+                key=f"{key_base}_low",
+                label_visibility="collapsed",
+            )
+            high_val = high.number_input(
+                "Upper",
+                value=float(cfg["high"]),
+                key=f"{key_base}_high",
+                label_visibility="collapsed",
+            )
+            cfg["initial"] = float(initial) if kind == "float" else int(initial)
+            cfg["low"] = float(low_val) if kind == "float" else int(low_val)
+            cfg["high"] = float(high_val) if kind == "float" else int(high_val)
+        elif kind == "bool":
+            cfg["initial"] = _bool_select("Initial", bool(cfg["initial"]), key=f"{key_base}_init")
+            c3.caption("Categorical — bounds not used")
+        else:
+            choices = list(cfg.get("choices", [cfg["initial"]]))
+            display = [("None" if opt is None else str(opt)) for opt in choices]
+            current = "None" if cfg["initial"] is None else str(cfg["initial"])
+            if current not in display:
+                display = [current] + display
+            chosen = c2.selectbox(
+                "Initial",
+                display,
+                index=display.index(current),
+                key=f"{key_base}_init",
+                label_visibility="collapsed",
+            )
+            cfg["initial"] = _parse_manual_value("choice", chosen, cfg["initial"])
+            if kind in {"bool", "choice", "optional_int", "str"} and "choices" in cfg:
+                c3.caption("Categorical — bounds not used")
+            else:
+                c3.caption("—")
+    return updated
+
+
+def _render_hyperparameter_optimization(
+    pfx: str,
+    frame: pd.DataFrame,
+    features: list[str],
+    target: str,
+    scheme: str,
+    n_folds: int,
+    val_fraction: float,
+    seed: int,
+) -> None:
+    st.subheader("Hyperparameter optimization")
+    st.caption(
+        "Select surrogate models, configure search bounds, then run tree-based Bayesian optimization "
+        "(Random Forest surrogate). Pick any trial from the results table to download."
+    )
+
+    selected = st.multiselect(
+        "Surrogate models to optimize",
+        list(REGRESSION_BO_MODELS),
+        default=[name for name in ("Ridge", "Random Forest", "Gradient Boosting") if name in REGRESSION_BO_MODELS],
+        key=f"{pfx}_bo_models",
+    )
+    c1, c2, c3 = st.columns(3)
+    objective = c1.selectbox(
+        "Objective metric",
+        list(REGRESSION_OBJECTIVES),
+        index=0,
+        key=f"{pfx}_bo_objective",
+        help="R² adj is maximized by default. RMSE, MAE, and MAPE (%) are minimized.",
+    )
+    n_calls = c2.slider(
+        "BO iterations per model",
+        min_value=5,
+        max_value=50,
+        value=15,
+        key=f"{pfx}_bo_n_calls",
+    )
+    scale = _bool_select("Standardize features", True, key=f"{pfx}_bo_scale")
+
+    param_setup: dict[str, dict[str, dict[str, Any]]] = {}
+    if selected:
+        st.markdown("**Hyperparameter search setup**")
+        st.caption("Set an initial guess and lower/upper bounds for numeric parameters. Click **Update the setup** before starting optimization.")
+        stored_setup = st.session_state.get(f"{pfx}_bo_param_setup") or {}
+        for model_name in selected:
+            defaults = stored_setup.get(model_name) or bo_default_param_config(model_name)
+            with st.expander(model_name, expanded=len(selected) == 1):
+                param_setup[model_name] = _render_bo_param_controls(pfx, model_name, defaults)
+
+    if st.button("Update the setup", type="secondary", disabled=len(selected) == 0):
+        st.session_state[f"{pfx}_bo_param_setup"] = param_setup
+        fingerprint = _bo_setup_fingerprint(selected, objective, scale, n_calls, param_setup)
+        st.session_state[f"{pfx}_bo_setup_fingerprint"] = fingerprint
+        st.session_state[f"{pfx}_bo_setup_ready"] = True
+        st.session_state.pop(f"{pfx}_bo_results", None)
+        st.session_state.pop(f"{pfx}_bo_fitted", None)
+        st.success("Hyperparameter setup saved. You can start tree-based Bayesian optimization.")
+
+    current_fp = _bo_setup_fingerprint(
+        selected,
+        objective,
+        scale,
+        n_calls,
+        st.session_state.get(f"{pfx}_bo_param_setup") or param_setup,
+    )
+    setup_ready = (
+        st.session_state.get(f"{pfx}_bo_setup_ready")
+        and st.session_state.get(f"{pfx}_bo_setup_fingerprint") == current_fp
+        and len(selected) > 0
+    )
+    if st.session_state.get(f"{pfx}_bo_setup_ready") and not setup_ready:
+        st.warning("Model selection or hyperparameter setup changed. Click **Update the setup** again.")
+
+    if setup_ready and st.button("Start Tree-based Bayesian Optimization", type="primary"):
+        if not _assignment_is_fresh(pfx, scheme, n_folds, val_fraction, seed, len(frame), features, target):
+            st.error("Refresh the assignment table before optimization.")
+            st.stop()
+        committed_setup = st.session_state.get(f"{pfx}_bo_param_setup") or {}
+        try:
+            if scheme == "Split Dataset":
+                x_train, x_test, y_train, y_test = split_xy(
+                    frame, features, target, val_fraction, seed, stratify=False
+                )
+                inner_cv = make_cv_splitter("CV folds", 5, seed, stratify=False)
+                search_x, search_y = x_train, y_train
+            else:
+                x_train = x_test = frame[features]
+                y_train = y_test = frame[target]
+                inner_cv = make_cv_splitter(scheme, n_folds, seed, stratify=False)
+                search_x, search_y = x_train, y_train
+            direction = objective_direction(objective)
+            total_steps = bo_total_steps(selected, committed_setup, n_calls)
+            progress_bar = st.progress(0.0)
+            status = st.empty()
+            status.caption(f"Step 0 / {total_steps} · preparing…")
+
+            def _bo_progress(
+                current: int,
+                total: int,
+                model_name: str,
+                trial: int,
+                model_trials: int,
+                model_index: int,
+                model_count: int,
+            ) -> None:
+                frac = 0.0 if total <= 0 else min(float(current) / float(total), 1.0)
+                progress_bar.progress(frac)
+                if trial <= 0:
+                    status.caption(
+                        f"Step {current} / {total} · model {model_index}/{model_count}: **{model_name}** "
+                        f"({model_trials} trials scheduled)"
+                    )
+                else:
+                    status.caption(
+                        f"Step {current} / {total} · **{model_name}** trial {trial}/{model_trials} "
+                        f"(model {model_index}/{model_count})"
+                    )
+
+            table, fitted = run_tree_bayesian_optimization(
+                selected,
+                committed_setup,
+                search_x,
+                search_y,
+                scale,
+                inner_cv,
+                objective,
+                n_calls,
+                seed,
+                progress_callback=_bo_progress,
+            )
+            progress_bar.progress(1.0)
+            status.caption(f"Step {total_steps} / {total_steps} · optimization complete.")
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        except Exception as exc:
+            st.error(f"Optimization failed: {exc}")
+            st.stop()
+
+        st.session_state[f"{pfx}_bo_results"] = table
+        st.session_state[f"{pfx}_bo_fitted"] = fitted
+        st.session_state[f"{pfx}_bo_context"] = {
+            "scheme": scheme,
+            "n_folds": n_folds,
+            "val_fraction": val_fraction,
+            "seed": seed,
+            "objective": objective,
+            "direction": direction,
+            "x_train": x_train,
+            "x_test": x_test,
+            "y_train": y_train,
+            "y_test": y_test,
+            "inner_cv": inner_cv,
+        }
+        best = table.iloc[0]
+        st.success(
+            f"Completed optimization across {len(selected)} model(s). "
+            f"Best {objective}: **{best['Score']:.4f}** ({best['Model']}, trial {best['Trial']}). "
+            "Select any row below to download."
+        )
+
+    results = st.session_state.get(f"{pfx}_bo_results")
+    if results is None or results.empty:
+        return
+
+    display = results.drop(columns=["params", "row_id"], errors="ignore")
+    st.subheader("Optimization results")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    labels = [
+        f"{row['Model']} · trial {row['Trial']} · {st.session_state.get(f'{pfx}_bo_context', {}).get('objective', objective)} = {row['Score']:.4f}"
+        for _, row in results.iterrows()
+    ]
+    selected_label = st.selectbox(
+        "Select result to use for download and diagnostics",
+        labels,
+        key=f"{pfx}_bo_pick",
+    )
+    pick_idx = labels.index(selected_label)
+    picked = results.iloc[pick_idx]
+    ctx = st.session_state.get(f"{pfx}_bo_context", {})
+    if st.button("Apply selected result", type="primary", key=f"{pfx}_bo_apply"):
+        try:
+            result = refit_bo_selection(
+                str(picked["Model"]),
+                dict(picked["params"]),
+                ctx["x_train"],
+                ctx["y_train"],
+                ctx["x_test"],
+                ctx["y_test"],
+                scale,
+                ctx["scheme"],
+                ctx["n_folds"],
+                ctx["seed"],
+                cv=ctx.get("inner_cv"),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        _persist_result(pfx, result, str(picked["Model"]), "regression")
+        st.session_state[f"{pfx}_comparison"] = display
+        st.success(f"Using **{picked['Model']}** (trial {picked['Trial']}) for download and downstream pages.")
+
+    pipeline = st.session_state.get(f"{pfx}_pipeline")
+    metrics = st.session_state.get(f"{pfx}_metrics")
+    y_test = st.session_state.get(f"{pfx}_y_test")
+    y_pred = st.session_state.get(f"{pfx}_y_pred_test")
+    x_test = st.session_state.get(f"{pfx}_X_test")
+    if pipeline is None or metrics is None:
+        return
+
+    metric_label = st.session_state.get(f"{pfx}_metric_label", "Validation metrics")
+    _show_metrics(metrics, metric_label, n_samples=None if y_test is None else len(y_test))
+    _show_diagnostics("regression", y_test, y_pred, pipeline, features, x_test=x_test, pfx=pfx)
+    download_fitted_model(pfx, pipeline, key=f"{pfx}_dl_fmt_train")
+
+
 def render(task: str, advanced: bool = False) -> None:
     kind = ml_kind(task)
     is_reg = kind == "regression"
     family = family_label(task)
-    title = "Advance Training" if advanced else "Training"
+    title = "Hyperparameter Optimization" if advanced else "Training"
     lead = (
-        "Compare algorithms with the selected validation scheme and keep the best pipeline."
+        "Configure search bounds and run tree-based Bayesian optimization across surrogate models."
         if advanced
         else "Fit a baseline surrogate using a hold-out split, k-fold CV, or LOOCV."
     )
@@ -484,75 +793,9 @@ def render(task: str, advanced: bool = False) -> None:
 
     if assign_ready:
         if advanced:
-            selected = st.multiselect(
-                "Models to compare",
-                list(models),
-                default=[name for name in ("Ridge", "Random Forest", "Gradient Boosting", "SVR") if name in models][:3]
-                or list(models)[:3],
+            _render_hyperparameter_optimization(
+                pfx, frame, features, target, scheme, n_folds, val_fraction, seed
             )
-            c1, c2 = st.columns(2)
-            n_iter = c1.slider("Search iterations", 4, 20, 8)
-            with c2:
-                scale = _bool_select("Standardize features", True, key=f"{pfx}_adv_algo_scale")
-            if st.button(
-                "Run comparison",
-                type="primary",
-                disabled=len(selected) == 0,
-            ):
-                if not _assignment_is_fresh(pfx, scheme, n_folds, val_fraction, seed, len(frame), features, target):
-                    st.error("Refresh the assignment table before training.")
-                    st.stop()
-                stratify = not is_reg and scheme != "LOOCV"
-                try:
-                    if scheme == "Split Dataset":
-                        x_train, x_test, y_train, y_test = split_xy(
-                            frame, features, target, val_fraction, seed, stratify=stratify
-                        )
-                        inner_cv = make_cv_splitter("CV folds", 5, seed, stratify=stratify)
-                        search_x, search_y = x_train, y_train
-                    else:
-                        x_train = x_test = frame[features]
-                        y_train = y_test = frame[target]
-                        inner_cv = make_cv_splitter(scheme, n_folds, seed, stratify=stratify)
-                        search_x, search_y = x_train, y_train
-                    with st.spinner("Cross-validating models…"):
-                        table, winner, pipeline = compare_models(
-                            kind, selected, search_x, search_y, scale, n_iter, seed, inner_cv
-                        )
-                except ValueError as exc:
-                    st.error(str(exc))
-                    st.stop()
-                y_pred_train = pipeline.predict(x_train)
-                if scheme == "Split Dataset":
-                    y_pred_test = pipeline.predict(x_test)
-                else:
-                    y_pred_test = cross_val_predict(pipeline, x_train, y_train, cv=inner_cv)
-                metrics = {
-                    "train": score_predictions(kind, y_train.to_numpy(), y_pred_train, n_features=x_train.shape[1]),
-                    "test": score_predictions(kind, y_test.to_numpy(), y_pred_test, n_features=x_test.shape[1]),
-                }
-                label = "Hold-out validation" if scheme == "Split Dataset" else (
-                    "LOOCV" if scheme == "LOOCV" else f"{n_folds}-fold CV"
-                )
-                st.session_state[f"{pfx}_comparison"] = table
-                _persist_result(
-                    pfx,
-                    {
-                        "pipeline": pipeline,
-                        "metrics": metrics,
-                        "X_train": x_train,
-                        "X_test": x_test,
-                        "y_train": y_train,
-                        "y_test": y_test,
-                        "y_pred_train": y_pred_train,
-                        "y_pred_test": y_pred_test,
-                        "metric_label": label,
-                    },
-                    winner,
-                    kind,
-                )
-                st.success(f"Best model by CV: **{winner}**. Use Download fitted model to save a file.")
-
         else:
             model_name, scale, params = _algorithm_setup(kind, pfx, models)
             if st.button("Train model", type="primary"):
@@ -584,9 +827,7 @@ def render(task: str, advanced: bool = False) -> None:
                 )
 
     if advanced:
-        table = st.session_state.get(f"{pfx}_comparison")
-        if table is not None:
-            st.dataframe(table, use_container_width=True, hide_index=True)
+        return
 
     pipeline = st.session_state.get(f"{pfx}_pipeline")
     metrics = st.session_state.get(f"{pfx}_metrics")

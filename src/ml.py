@@ -239,6 +239,61 @@ def hyperparam_schema(task: str, name: str) -> dict[str, tuple[str, Any]]:
 def default_hyperparams(task: str, name: str) -> dict[str, Any]:
     return {key: default for key, (_kind, default) in hyperparam_schema(task, name).items()}
 
+
+def _coerce_hyperparam_value(kind: str, raw: Any, default: Any) -> Any:
+    """Cast a hyperparameter value to the schema type (handles UI / session string booleans)."""
+    if raw is None:
+        return None
+    if kind == "bool":
+        if isinstance(raw, (bool, np.bool_)):
+            return bool(raw)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"true", "1", "yes"}:
+                return True
+            if lowered in {"false", "0", "no"}:
+                return False
+        return bool(raw)
+    if kind == "choice":
+        if raw in {"None", "none"}:
+            return None
+        if default is None and str(raw).lower() in {"none", "null"}:
+            return None
+        return raw
+    text = str(raw).strip()
+    if kind == "optional_int":
+        if text.lower() in {"", "none", "null"}:
+            return None
+        return int(float(text))
+    if kind == "tuple_int":
+        cleaned = text.strip("()[] ")
+        if not cleaned:
+            return default
+        return tuple(int(float(part.strip())) for part in cleaned.split(",") if part.strip())
+    if kind == "int":
+        return int(float(text))
+    if kind == "float":
+        return float(text)
+    if kind == "str":
+        if text.lower() in {"none", "null"}:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    return raw
+
+
+def coerce_hyperparams(task: str, model_name: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Coerce hyperparameter dict values to schema types."""
+    schema = hyperparam_schema(task, model_name)
+    return {
+        name: _coerce_hyperparam_value(schema[name][0], value, schema[name][1])
+        if name in schema
+        else value
+        for name, value in params.items()
+    }
+
 SEARCH_SPACES: dict[str, dict[str, list[Any]]] = {
     "Ridge": {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
     "Lasso": {"model__alpha": [0.001, 0.01, 0.1, 1.0]},
@@ -874,6 +929,422 @@ def compare_models(
     table = pd.DataFrame(rows).sort_values("CV score", ascending=False).reset_index(drop=True)
     winner = str(table.iloc[0]["Model"])
     return table, winner, fitted[winner]
+
+
+REGRESSION_BO_MODELS: tuple[str, ...] = tuple(name for name in REGRESSORS if name != "MLP")
+
+REGRESSION_OBJECTIVES: tuple[str, ...] = ("R² adj", "R²", "RMSE", "MAE", "MAPE (%)")
+
+# Parameters excluded from Bayesian optimization (fixed during search).
+_BO_SKIP_PARAMS = frozenset({"random_state"})
+
+# Default initial guess and search bounds for the hyperparameter optimization UI.
+BO_DEFAULT_BOUNDS: dict[str, dict[str, dict[str, Any]]] = {
+    "Linear Regression": {
+        "fit_intercept": {"initial": True, "choices": [True, False]},
+    },
+    "Ridge": {
+        "alpha": {"initial": 1.0, "low": 0.001, "high": 100.0},
+        "fit_intercept": {"initial": True, "choices": [True, False]},
+    },
+    "Lasso": {
+        "alpha": {"initial": 0.01, "low": 0.0001, "high": 10.0},
+        "max_iter": {"initial": 5000, "low": 500, "high": 20000},
+        "fit_intercept": {"initial": True, "choices": [True, False]},
+    },
+    "Random Forest": {
+        "n_estimators": {"initial": 200, "low": 50, "high": 500},
+        "max_depth": {"initial": None, "choices": [None, 4, 6, 8, 10, 12, 16, 20]},
+        "min_samples_split": {"initial": 2, "low": 2, "high": 20},
+        "min_samples_leaf": {"initial": 1, "low": 1, "high": 10},
+        "max_features": {"initial": "sqrt", "choices": ["sqrt", "log2", None, "1.0"]},
+    },
+    "Gradient Boosting": {
+        "n_estimators": {"initial": 100, "low": 50, "high": 300},
+        "learning_rate": {"initial": 0.1, "low": 0.01, "high": 0.3},
+        "max_depth": {"initial": 3, "low": 2, "high": 8},
+        "min_samples_split": {"initial": 2, "low": 2, "high": 20},
+        "min_samples_leaf": {"initial": 1, "low": 1, "high": 10},
+        "subsample": {"initial": 1.0, "low": 0.5, "high": 1.0},
+    },
+    "SVR": {
+        "C": {"initial": 1.0, "low": 0.01, "high": 100.0},
+        "kernel": {"initial": "rbf", "choices": ["rbf", "linear", "poly", "sigmoid"]},
+        "gamma": {"initial": "scale", "choices": ["scale", "auto", 0.001, 0.01, 0.1, 1.0]},
+        "epsilon": {"initial": 0.1, "low": 0.001, "high": 1.0},
+    },
+    "KNN": {
+        "n_neighbors": {"initial": 5, "low": 1, "high": 30},
+        "weights": {"initial": "uniform", "choices": ["uniform", "distance"]},
+        "p": {"initial": 2, "low": 1, "high": 3},
+    },
+    "GPR": {
+        "kernel": {"initial": "RBF", "choices": ["RBF", "Matern", "RBF+White", "DotProduct", "DotProduct+White"]},
+        "alpha": {"initial": 1e-10, "low": 1e-12, "high": 1e-2},
+        "n_restarts_optimizer": {"initial": 2, "low": 0, "high": 10},
+        "normalize_y": {"initial": True, "choices": [True, False]},
+    },
+}
+
+
+def objective_direction(metric: str) -> str:
+    """Return ``maximize`` or ``minimize`` for a regression objective."""
+    if metric in {"R²", "R² adj"}:
+        return "maximize"
+    return "minimize"
+
+
+def bo_tunable_schema(model_name: str) -> dict[str, tuple[str, Any]]:
+    """Hyperparameter schema for Bayesian optimization (regression only)."""
+    schema = hyperparam_schema("regression", model_name)
+    return {key: spec for key, spec in schema.items() if key not in _BO_SKIP_PARAMS}
+
+
+def bo_default_param_config(model_name: str) -> dict[str, dict[str, Any]]:
+    """Merge schema defaults with BO_DEFAULT_BOUNDS for UI initialization."""
+    schema = bo_tunable_schema(model_name)
+    model_bounds = BO_DEFAULT_BOUNDS.get(model_name, {})
+    configs: dict[str, dict[str, Any]] = {}
+    for name, (kind, default) in schema.items():
+        bounds = dict(model_bounds.get(name, {}))
+        entry: dict[str, Any] = {"kind": kind, "initial": bounds.get("initial", default)}
+        if kind in {"float", "int", "optional_int"}:
+            if kind == "optional_int":
+                entry["kind"] = "optional_int"
+                entry["choices"] = bounds.get(
+                    "choices",
+                    [None, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20],
+                )
+            else:
+                entry["low"] = bounds.get("low", float(default) * 0.1 if kind == "float" else max(1, int(default) // 2))
+                entry["high"] = bounds.get(
+                    "high",
+                    float(default) * 10.0 if kind == "float" else max(int(default) * 2, int(entry["low"]) + 1),
+                )
+        elif kind == "bool":
+            entry["choices"] = bounds.get("choices", [True, False])
+        elif kind == "choice":
+            if name == "kernel" and model_name == "GPR":
+                entry["choices"] = bounds.get("choices", CHOICES.get("gp_kernel", [default]))
+            else:
+                entry["choices"] = bounds.get("choices", CHOICES.get(name, [default]))
+        elif kind == "str":
+            entry["choices"] = bounds.get("choices", ["scale", "auto", 0.001, 0.01, 0.1, 1.0])
+        configs[name] = entry
+    return configs
+
+
+def _bo_params_display(params: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in params.items():
+        parts.append(f"{key}={value}")
+    return ", ".join(parts) if parts else "defaults"
+
+
+def _bo_decode_point(point: list[Any], param_order: list[tuple[str, str]]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for (name, kind), raw in zip(param_order, point):
+        if kind == "float":
+            params[name] = float(raw)
+        elif kind == "int":
+            params[name] = int(raw)
+        elif kind == "bool":
+            params[name] = _coerce_hyperparam_value("bool", raw, True)
+        else:
+            if raw in {"None", "none"}:
+                params[name] = None
+            else:
+                params[name] = raw
+    return params
+
+
+def _bo_build_dimensions(
+    param_configs: dict[str, dict[str, Any]],
+) -> tuple[list[Any], list[Any], list[tuple[str, str]]]:
+    from skopt.space import Categorical, Integer, Real
+
+    dimensions: list[Any] = []
+    x0: list[Any] = []
+    order: list[tuple[str, str]] = []
+    for name, cfg in param_configs.items():
+        kind = str(cfg["kind"])
+        initial = cfg["initial"]
+        if kind == "float":
+            low = float(cfg["low"])
+            high = float(cfg["high"])
+            if low > high:
+                low, high = high, low
+            initial = float(np.clip(float(initial), low, high))
+            dimensions.append(Real(low, high, name=name))
+            x0.append(initial)
+            order.append((name, "float"))
+        elif kind == "int":
+            low = int(cfg["low"])
+            high = int(cfg["high"])
+            if low > high:
+                low, high = high, low
+            initial = int(np.clip(int(initial), low, high))
+            dimensions.append(Integer(low, high, name=name))
+            x0.append(initial)
+            order.append((name, "int"))
+        elif kind == "bool":
+            initial = _coerce_hyperparam_value("bool", cfg["initial"], True)
+            dimensions.append(Categorical([True, False], name=name))
+            x0.append(initial)
+            order.append((name, "bool"))
+        else:
+            choices = list(cfg.get("choices", [initial]))
+            if initial not in choices:
+                choices = [initial] + choices
+            dimensions.append(Categorical(choices, name=name))
+            x0.append(initial)
+            order.append((name, "categorical"))
+    return dimensions, x0, order
+
+
+def _merge_bo_params(
+    task: str,
+    model_name: str,
+    params: dict[str, Any] | None,
+    seed: int,
+) -> dict[str, Any]:
+    """Merge BO trial params with defaults; only set random_state when supported."""
+    merged = default_hyperparams(task, model_name)
+    if params:
+        merged.update(coerce_hyperparams(task, model_name, params))
+    if "random_state" in hyperparam_schema(task, model_name):
+        merged["random_state"] = seed
+    if model_name == "Ridge":
+        merged["solver"] = "svd"
+    return merged
+
+
+def _bo_cv_score(
+    task: str,
+    model_name: str,
+    params: dict[str, Any],
+    x_data: pd.DataFrame,
+    y_data: pd.Series,
+    scale: bool,
+    cv: Any,
+    objective: str,
+    seed: int,
+) -> float:
+    n_features = int(x_data.shape[1])
+    merged = _merge_bo_params(task, model_name, params, seed)
+    pipe = make_pipeline(make_estimator(task, model_name, merged, n_features=n_features), scale)
+    y_pred = cross_val_predict(pipe, x_data, y_data, cv=cv, n_jobs=1)
+    metrics = score_predictions(task, y_data.to_numpy(), y_pred, n_features=n_features)
+    return float(metrics[objective])
+
+
+def _bo_iteration_count(configs: dict[str, dict[str, Any]], n_calls: int) -> int:
+    """Number of BO trials scheduled for one model."""
+    if not configs:
+        return 1
+    n_initial = min(max(2, len(configs)), max(2, n_calls // 3))
+    return max(n_initial, int(n_calls))
+
+
+def bo_total_steps(
+    model_names: list[str],
+    param_setup: dict[str, dict[str, dict[str, Any]]],
+    n_calls: int,
+) -> int:
+    """Total BO trials across all selected models."""
+    total = 0
+    for model_name in model_names:
+        configs = param_setup.get(model_name, bo_default_param_config(model_name))
+        total += _bo_iteration_count(configs, n_calls)
+    return total
+
+
+def run_tree_bayesian_optimization(
+    model_names: list[str],
+    param_setup: dict[str, dict[str, dict[str, Any]]],
+    x_data: pd.DataFrame,
+    y_data: pd.Series,
+    scale: bool,
+    cv: Any,
+    objective: str,
+    n_calls: int,
+    seed: int,
+    progress_callback: Any | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Tree-based Bayesian optimization (Random Forest surrogate) per model."""
+    from skopt import forest_minimize
+
+    direction = objective_direction(objective)
+    rows: list[dict[str, Any]] = []
+    fitted: dict[str, Any] = {}
+    row_id = 0
+    total_steps = bo_total_steps(model_names, param_setup, n_calls)
+    steps_before = 0
+
+    for model_idx, model_name in enumerate(model_names, start=1):
+        configs = param_setup.get(model_name, bo_default_param_config(model_name))
+        model_total = _bo_iteration_count(configs, n_calls)
+        if progress_callback is not None:
+            progress_callback(
+                steps_before,
+                total_steps,
+                model_name,
+                0,
+                model_total,
+                model_idx,
+                len(model_names),
+            )
+        if not configs:
+            n_features = int(x_data.shape[1])
+            merged = _merge_bo_params("regression", model_name, None, seed)
+            pipe = make_pipeline(make_estimator("regression", model_name, merged, n_features=n_features), scale)
+            y_pred = cross_val_predict(pipe, x_data, y_data, cv=cv, n_jobs=1)
+            score = float(
+                score_predictions("regression", y_data.to_numpy(), y_pred, n_features=n_features)[objective]
+            )
+            params: dict[str, Any] = {}
+            pipe.fit(x_data, y_data)
+            key = f"{model_name}::0"
+            fitted[key] = pipe
+            rows.append(
+                {
+                    "row_id": row_id,
+                    "Model": model_name,
+                    "Trial": 0,
+                    "Score": score,
+                    "Hyperparameters": _bo_params_display(params),
+                    "params": params,
+                }
+            )
+            row_id += 1
+            steps_before += 1
+            if progress_callback is not None:
+                progress_callback(
+                    steps_before,
+                    total_steps,
+                    model_name,
+                    1,
+                    1,
+                    model_idx,
+                    len(model_names),
+                )
+            continue
+
+        dimensions, x0, order = _bo_build_dimensions(configs)
+        model_calls = model_total
+
+        def objective_fn(point: list[Any], *, _model: str = model_name) -> float:
+            params = _bo_decode_point(point, order)
+            score = _bo_cv_score(
+                "regression",
+                _model,
+                params,
+                x_data,
+                y_data,
+                scale,
+                cv,
+                objective,
+                seed,
+            )
+            if not np.isfinite(score):
+                return 1e6
+            return -score if direction == "maximize" else score
+
+        n_initial = min(max(2, len(dimensions)), max(2, n_calls // 3))
+
+        def skopt_callback(res: Any) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                steps_before + len(res.func_vals),
+                total_steps,
+                model_name,
+                len(res.func_vals),
+                model_total,
+                model_idx,
+                len(model_names),
+            )
+
+        result = forest_minimize(
+            objective_fn,
+            dimensions,
+            x0=x0,
+            n_calls=model_calls,
+            n_initial_points=n_initial,
+            random_state=seed,
+            acq_func="EI",
+            callback=skopt_callback,
+        )
+        steps_before += model_total
+
+        n_features = int(x_data.shape[1])
+        for trial_idx, (point, raw_val) in enumerate(zip(result.x_iters, result.func_vals)):
+            params = _bo_decode_point(list(point), order)
+            score = float(-raw_val if direction == "maximize" else raw_val)
+            merged = _merge_bo_params("regression", model_name, params, seed)
+            pipe = make_pipeline(make_estimator("regression", model_name, merged, n_features=n_features), scale)
+            pipe.fit(x_data, y_data)
+            key = f"{model_name}::{trial_idx}"
+            fitted[key] = pipe
+            rows.append(
+                {
+                    "row_id": row_id,
+                    "Model": model_name,
+                    "Trial": trial_idx,
+                    "Score": score,
+                    "Hyperparameters": _bo_params_display(params),
+                    "params": params,
+                }
+            )
+            row_id += 1
+
+    table = pd.DataFrame(rows)
+    ascending = direction == "minimize"
+    table = table.sort_values("Score", ascending=ascending).reset_index(drop=True)
+    return table, fitted
+
+
+def refit_bo_selection(
+    model_name: str,
+    params: dict[str, Any],
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    scale: bool,
+    scheme: str,
+    n_folds: int,
+    seed: int,
+    cv: Any | None = None,
+) -> dict[str, Any]:
+    """Refit a Bayesian-optimization candidate for download and diagnostics."""
+    n_features = int(x_train.shape[1])
+    merged = _merge_bo_params("regression", model_name, params, seed)
+    pipe = make_pipeline(make_estimator("regression", model_name, merged, n_features=n_features), scale)
+    pipe.fit(x_train, y_train)
+    y_pred_train = pipe.predict(x_train)
+    if scheme == "Split Dataset":
+        y_pred_test = pipe.predict(x_test)
+        label = "Hold-out validation"
+    else:
+        splitter = cv if cv is not None else make_cv_splitter(scheme, n_folds, seed, stratify=False)
+        y_pred_test = cross_val_predict(pipe, x_train, y_train, cv=splitter, n_jobs=1)
+        label = "LOOCV" if scheme == "LOOCV" else f"{n_folds}-fold CV"
+    metrics = {
+        "train": score_predictions("regression", y_train.to_numpy(), y_pred_train, n_features=n_features),
+        "test": score_predictions("regression", y_test.to_numpy(), y_pred_test, n_features=n_features),
+    }
+    return {
+        "pipeline": pipe,
+        "metrics": metrics,
+        "X_train": x_train,
+        "X_test": x_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "y_pred_train": y_pred_train,
+        "y_pred_test": y_pred_test,
+        "metric_label": label,
+    }
 
 
 def _kernel_length_scales(kernel: Any) -> np.ndarray | None:

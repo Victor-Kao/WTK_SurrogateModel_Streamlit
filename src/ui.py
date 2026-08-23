@@ -273,7 +273,7 @@ def render_sidebar() -> str:
 
             st.markdown('<div class="nested-label">Subpage</div>', unsafe_allow_html=True)
             if family == "Regression":
-                options = ["Import Data", "Training", "Advance Training"]
+                options = ["Import Data", "Training", "Hyperparameter Optimization"]
                 current = st.session_state.ml_reg_step
                 step = st.radio(
                     "Regression step",
@@ -286,7 +286,7 @@ def render_sidebar() -> str:
                 mapping = {
                     "Import Data": "reg_import",
                     "Training": "reg_train",
-                    "Advance Training": "reg_advance",
+                    "Hyperparameter Optimization": "reg_advance",
                 }
                 route = mapping[step]
             elif family == "Binary Classification":

@@ -52,7 +52,7 @@ def _render_visuals(
     model_name: str = "model",
 ) -> None:
     if comparison is not None:
-        st.subheader("Advance training comparison")
+        st.subheader("Hyperparameter optimization results")
         st.dataframe(comparison, use_container_width=True, hide_index=True)
 
     if ml_kind(task) == "classification":
