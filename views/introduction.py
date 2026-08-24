@@ -53,6 +53,7 @@ def render() -> None:
           <div class="hero-card"><div class="hero-num">03</div><h4>Machine Learning</h4><p>Regression and classification tracks, each with import and training steps.</p></div>
           <div class="hero-card"><div class="hero-num">04</div><h4>Validation</h4><p>Score a held-out or independent dataset against the fitted surrogate.</p></div>
           <div class="hero-card"><div class="hero-num">05</div><h4>Model Information</h4><p>Inspect parameters, diagnostics, and response-surface visualization.</p></div>
+          <div class="hero-card"><div class="hero-num">06</div><h4>Data Analysis</h4><p>Load a table or demo set and inspect the feature correlation matrix.</p></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -68,6 +69,7 @@ def render() -> None:
             3. Fit a baseline on **Training**. Optionally tune hyperparameters on **Hyperparameter Optimization** (regression).
             4. Confirm generalization on **Validation**.
             5. Inspect slices, importance, and diagnostics on **Model Information & Visualization**.
+            6. Explore feature relationships on **Data Analysis**.
             """
         )
 

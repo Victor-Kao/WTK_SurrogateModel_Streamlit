@@ -348,3 +348,73 @@ def error_histogram(errors: np.ndarray, mean: float, std: float) -> go.Figure:
     fig.update_xaxes(title="error (observed − predicted)")
     fig.update_yaxes(title="Count")
     return _layout(fig, "Error histogram")
+
+
+def feature_scatter(
+    frame: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    title: str | None = None,
+) -> go.Figure:
+    """2D scatter of two numeric columns."""
+    clean = frame[[x_name, y_name]].dropna()
+    fig = go.Figure(
+        go.Scatter(
+            x=clean[x_name],
+            y=clean[y_name],
+            mode="markers",
+            marker=dict(color=COPPER, size=8, opacity=0.75, line=dict(width=0)),
+            name="samples",
+            hovertemplate=f"{x_name}=%{{x}}<br>{y_name}=%{{y}}<extra></extra>",
+        )
+    )
+    fig.update_xaxes(title=x_name)
+    fig.update_yaxes(title=y_name)
+    return _layout(fig, title or f"{y_name} vs {x_name}")
+
+
+def correlation_heatmap(
+    corr: pd.DataFrame,
+    title: str = "Correlation matrix",
+    *,
+    coeff_label: str = "r",
+) -> go.Figure:
+    """Correlation heatmap; values ≈0 match the dark theme panel (low contrast)."""
+    n = len(corr.columns)
+    text = np.round(corr.to_numpy(dtype=float), 2)
+    # Midpoint blends into dark UI; ends use app blue / copper accents
+    colorscale = [
+        [0.00, "#3B82F6"],
+        [0.25, "#2A4A6E"],
+        [0.45, "#1E2A38"],
+        [0.50, "#1A2330"],
+        [0.55, "#2A241C"],
+        [0.75, "#8A5E38"],
+        [1.00, "#D08C4A"],
+    ]
+    fig = px.imshow(
+        corr,
+        text_auto=False,
+        zmin=-1.0,
+        zmax=1.0,
+        color_continuous_scale=colorscale,
+        aspect="auto",
+        labels=dict(color=coeff_label),
+    )
+    fig.update_traces(
+        text=text,
+        texttemplate="%{text:.2f}",
+        textfont_size=11 if n <= 12 else 9,
+        textfont_color="#E6EDF3",
+        hovertemplate="%{y} vs %{x}<br>" + coeff_label + "=%{z:.3f}<extra></extra>",
+    )
+    height = int(min(720, max(380, 42 * n + 140)))
+    fig = _layout(fig, title)
+    fig.update_layout(
+        height=height,
+        coloraxis_colorbar=dict(title=coeff_label, thickness=12, len=0.85),
+        margin=dict(l=40, r=20, t=50, b=60),
+    )
+    fig.update_xaxes(side="bottom", tickangle=-45)
+    fig.update_yaxes(autorange="reversed")
+    return fig

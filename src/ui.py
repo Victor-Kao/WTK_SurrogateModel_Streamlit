@@ -178,6 +178,7 @@ STEPS = [
     ("3", "Machine Learning"),
     ("4", "Validation"),
     ("5", "Model Info"),
+    ("6", "Data Analysis"),
 ]
 
 MAIN_PAGES = [
@@ -186,6 +187,7 @@ MAIN_PAGES = [
     ("ml", "3", "Machine Learning"),
     ("validation", "4", "Validation"),
     ("performance", "5", "Model Information & Visualization"),
+    ("data_analysis", "6", "Data Analysis"),
 ]
 
 

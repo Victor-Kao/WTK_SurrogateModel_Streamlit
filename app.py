@@ -13,7 +13,7 @@ st.set_page_config(
 
 from src.state import init_state
 from src.ui import inject_css, render_sidebar
-from views import data_import, doe_sampling, introduction, performance, training, validation
+from views import data_analysis, data_import, doe_sampling, introduction, performance, training, validation
 
 inject_css()
 init_state()
@@ -44,5 +44,9 @@ elif route == "clf_train":
     training.render("binary_classification")
 elif route == "validation":
     validation.render()
+elif route == "data_analysis":
+    data_analysis.render()
+elif route == "performance":
+    performance.render()
 else:
     performance.render()
